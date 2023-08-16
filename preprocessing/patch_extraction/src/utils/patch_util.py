@@ -10,7 +10,7 @@ import json
 import math
 import warnings
 from pathlib import Path
-from typing import Generator, List, Tuple, Union
+from typing import Generator, List, Optional, Tuple, Union
 
 import cv2
 import geojson
@@ -97,8 +97,8 @@ def patch_to_tile_size(patch_size: int, overlap: int) -> int:
     return patch_size - overlap * 2
 
 
-def target_mag_to_downsample(
-    base_mag: float, target_mag: float, init_downsample: int = 1
+def target_mag_to_downsample(slide: openslide.OpenSlide,
+                             target_mag: float, init_downsample: int = 1
 ) -> int:
     """Convert the target magnification to a specific downsampling factor based on the base magnification of an image.
 
@@ -118,7 +118,8 @@ def target_mag_to_downsample(
         factor is 40/5 = 8. The downsampling factor must be a power of 2
     """
     try:
-        base_mag = int(round(base_mag))
+        base_mag = slide.properties["openslide.objective-power"]
+        base_mag = int(round(float(base_mag)))
         if target_mag is not None:
             if np.log2((base_mag / target_mag)).is_integer():
                 downsample = int(base_mag / target_mag)
@@ -508,6 +509,7 @@ def generate_thumbnails(
     slide: OpenSlide,
     sample_factors: List[int] = [32, 64, 128],
     mpp_factors: List[float] = [5, 10],
+    slide_mpp: Optional[float] = None
 ) -> dict:
     """Generates a dictionary with thumbnails and corresponding thumbnail names
 
@@ -537,7 +539,10 @@ def generate_thumbnails(
             )
         )
         thumbnails[f"downsample_{sample_factor}"] = thumbnail
-    slide_mpp = float(slide.properties["openslide.mpp-x"])
+
+    if slide_mpp is None:
+        slide_mpp = float(slide.properties["openslide.mpp-x"])
+        
     # matching microns per pixel
     for mpp in mpp_factors:
         sample_factor = round(mpp / slide_mpp)

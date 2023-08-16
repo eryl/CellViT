@@ -29,6 +29,7 @@ class PreProcessingYamlConfig(BaseModel):
     output_path: Optional[str]
     wsi_extension: Optional[str]
     wsi_filelist: Optional[str]
+    slide_mpp: Optional[float]
 
     # basic setups
     patch_size: Optional[int]
@@ -128,6 +129,7 @@ class PreProcessingConfig(BaseModel):
         log_path (str, optional): Path where log files should be stored. Otherwise, log files are stored in the output folder. Defaults to None.
         log_level (str, optional): Set the logging level. Defaults to "info".
         hardware_selection (str, optional): Select hardware device (just if available, otherwise always cucim). Defaults to "cucim".
+        slide_mpp (float, optional): Manually prompt the microns per pixel of the slides, use when the attribute is not present in the slide metadata (e.g. for plain TIFF images)
 
     Raises:
         ValueError: Patch-size must be positive
@@ -145,6 +147,7 @@ class PreProcessingConfig(BaseModel):
     wsi_paths: Optional[str]
     wsi_filelist: Optional[str]
     wsi_extension: Optional[str] = "svs"
+    slide_mpp: Optional[float] = None
 
     # basic setups
     patch_size: Optional[int] = 256
@@ -318,6 +321,11 @@ class PreProcessingParser(ABCParser):
             choices=WSI_EXT,
             help="The extension types used for the WSI files, the "
             "options are: " + str(WSI_EXT),
+        )
+        parser.add_argument(
+            "--slide_mpp",
+            type=float,
+            help="The microns per pixel of the slide. Should be specified if there is no such corresponding entry in the slide metadata."
         )
 
         parser.add_argument(

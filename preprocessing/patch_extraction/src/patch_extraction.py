@@ -12,7 +12,7 @@ import os
 import random
 from pathlib import Path
 from shutil import rmtree
-from typing import Callable, List, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
 from openslide import OpenSlide
@@ -251,7 +251,7 @@ class PreProcessor(object):
                     polygons_downsampled_wsi,
                     region_labels_wsi,
                 ),
-            ) = self._prepare_wsi(wsi_file)
+            ) = self._prepare_wsi(wsi_file, slide_mpp=self.config.slide_mpp)
 
             # setup storage
             store = Storage(
@@ -415,7 +415,7 @@ class PreProcessor(object):
                 )
 
     def _prepare_wsi(
-        self, wsi_file: str
+        self, wsi_file: str, slide_mpp: Optional[float] = None
     ) -> Tuple[
         Tuple[int, int], Tuple[dict, dict, dict, dict], Callable, List[List[Tuple]]
     ]:
@@ -459,7 +459,7 @@ class PreProcessor(object):
 
         # Generate thumbnails
         logger.info("Generate thumbnails")
-        thumbnails = generate_thumbnails(slide, sample_factors=[32, 64, 128])
+        thumbnails = generate_thumbnails(slide, sample_factors=[32, 64, 128], slide_mpp=slide_mpp)
 
         # Check whether the resolution of the current image is the same as the given one
         self._check_wsi_resolution(slide.properties)
@@ -485,7 +485,7 @@ class PreProcessor(object):
         # target mag has precedence before downsample!
         if self.config.target_mag is not None:
             self.config.downsample = target_mag_to_downsample(
-                float(slide.properties.get("openslide.objective-power")),  # slide,
+                slide,
                 self.config.target_mag,
                 self.config.downsample,
             )
