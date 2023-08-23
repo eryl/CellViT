@@ -68,7 +68,6 @@ class PreProcessingYamlConfig(BaseModel):
     log_path: Optional[str]
     log_level: Optional[str]
     hardware_selection: Optional[str]
-    python_config_path: str
 
 
 class PreProcessingConfig(BaseModel):
@@ -514,12 +513,15 @@ class PreProcessingParser(ABCParser):
             choices=["cucim", "openslide"],
             help="Select hardware device (just if available, otherwise always cucim). Defaults to cucim.",
         )        # other
-        parser.add_argument(
-            "--python_config_path",
-            type=str,
-            help="Path where the python config file is stored",
-            default="configs/python/config.py"
-        )
+        
+        # The idea was to make the python config a loadable file, 
+        # but it controls other arguments it needs a larger refactoring
+        # parser.add_argument(
+        #     "--python_config_path",
+        #     type=str,
+        #     help="Path where the python config file is stored",
+        #     default="configs/python/config.py"
+        # )
 
         self.parser = parser
 
