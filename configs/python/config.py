@@ -7,7 +7,7 @@
 
 from typing import List
 
-WSI_EXT: List[str] = ["svs"]
+WSI_EXT: List[str] = ["svs", "tiff"]
 ANNOTATION_EXT: List[str] = ["json", "xml"]
 LOGGING_EXT: List[str] = ["critical", "error", "warning", "info", "debug"]
 
