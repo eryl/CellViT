@@ -36,6 +36,7 @@ def end_timer(start_time: float, timed_event: str = "Time usage") -> None:
         start_time (float): The number of seconds passed since epoch when the timer started
         timed_event (str, optional): A string describing the activity being monitored. Defaults to "Time usage".
     """
+    logger = logging.getLogger('__main__')
     logger.info(f"{timed_event}: {timedelta(seconds=timer() - start_time)}")
 
 
