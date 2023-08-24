@@ -172,6 +172,11 @@ class WSI:
 
         return patches, metadata
 
+    def get_patch(self, idx, transform: Callable = None):
+        patch = self.patches_list[idx]
+        transformed_patch, metadata = self.process_patch_image(patch, transform)
+        return transformed_patch, metadata
+
     def load_embedding(self) -> torch.Tensor:
         """Load embedding from subfolder patched_slide_path/embedding/
 
