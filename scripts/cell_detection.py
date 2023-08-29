@@ -20,7 +20,7 @@ import sys
 #import multiprocessing.dummy as multiprocessing
 import multiprocessing
 from multiprocessing.pool import ThreadPool
-import threading
+
 from time import sleep
 
 from cellvit.cell_segmentation.utils.post_proc import DetectionCellPostProcessor
@@ -46,22 +46,12 @@ import torch.nn.functional as F
 import tqdm
 import ujson
 from einops import rearrange
-#from pandarallel import pandarallel
 
 # from PIL import Image
 from shapely import strtree
 from shapely.errors import ShapelyDeprecationWarning
 from shapely.geometry import Polygon, MultiPolygon
 
-from viztracer import log_sparse
-
-try:
-    @profile
-    def f():
-        return
-except NameError:
-    def profile(f):
-        return f
 
 # from skimage.color import rgba2rgb
 from torch.utils.data import DataLoader, Dataset
@@ -195,8 +185,6 @@ def wsi_patch_collator(batch):
     return patches, local_idx, wsi_file, metadata
 
 
-#@profile
-@log_sparse(stack_depth=6)
 def f_post_processing_worker(wsi_file, wsi_work_list, postprocess_arguments):
     local_idxs, predictions_records, metadata = zip(*wsi_work_list)
     # Merge the prediction records into a single dictionary again.
@@ -222,7 +210,6 @@ class PostprocessArguments:
     wait_time: float = 2.
 
 
-@profile
 def postprocess_predictions(predictions, metadata, wsi, postprocessing_args: PostprocessArguments):
     # logger = postprocessing_args.logger
     logger = logging.getLogger()
@@ -416,7 +403,6 @@ def postprocess_predictions(predictions, metadata, wsi, postprocessing_args: Pos
     logger.info(f"{verbose_stats}")
 
 
-@profile
 def post_process_edge_cells(cell_list: List[dict], logger) -> List[int]:
     """Use the CellPostProcessor to remove multiple cells and merge due to overlap
 
@@ -991,7 +977,6 @@ class CellSegmentationInference:
 
 
 class CellPostProcessor:
-    @profile
     def __init__(self, cell_list: List[dict], logger: logging.Logger) -> None:
         """POst-Processing a list of cells from one WSI
 
@@ -1031,7 +1016,6 @@ class CellPostProcessor:
         self.mid_cells = [cell_record for cell_record in self.cell_records if cell_record["cell_status"] == 0]
         self.margin_cells = [cell_record for cell_record in self.cell_records if cell_record["cell_status"] != 0]
         
-    @profile
     def post_process_cells(self) -> List[Dict]:
         """Main Post-Processing coordinator, entry point
 
@@ -1048,7 +1032,6 @@ class CellPostProcessor:
 
         return postprocessed_cells
 
-    @profile
     def _clean_edge_cells(self) -> List[Dict]:
         """Create a record list that just contains all margin cells (cells inside the margin, not touching the border)
         and border/edge cells (touching border) with no overlapping equivalent (e.g, if patch has no neighbour)
@@ -1075,7 +1058,6 @@ class CellPostProcessor:
 
         return cleaned_edge_cells
 
-    @profile
     def _remove_overlap(self, cleaned_edge_cells: List[Dict]) -> List[Dict]:
         """Remove overlapping cells from provided cell record list
 
