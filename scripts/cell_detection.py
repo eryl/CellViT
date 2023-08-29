@@ -11,10 +11,17 @@
 # Institute for Artifical Intelligence in Medicine,
 # University Medicine Essen
 
+from dataclasses import dataclass
+from functools import partial
 import inspect
 import os
+import queue
 import sys
-import multiprocessing.dummy as multiprocessing
+#import multiprocessing.dummy as multiprocessing
+import multiprocessing
+from multiprocessing.pool import ThreadPool
+import threading
+from time import sleep
 
 from cellvit.cell_segmentation.utils.post_proc import DetectionCellPostProcessor
 
@@ -28,9 +35,9 @@ import argparse
 import logging
 import uuid
 import warnings
-from collections import deque
+from collections import defaultdict, deque
 from pathlib import Path
-from typing import List, Literal, OrderedDict, Tuple, Union, Callable
+from typing import Dict, List, Literal, OrderedDict, Tuple, Union, Callable
 
 import numpy as np
 import pandas as pd
@@ -39,17 +46,27 @@ import torch.nn.functional as F
 import tqdm
 import ujson
 from einops import rearrange
-from pandarallel import pandarallel
+#from pandarallel import pandarallel
 
 # from PIL import Image
 from shapely import strtree
 from shapely.errors import ShapelyDeprecationWarning
 from shapely.geometry import Polygon, MultiPolygon
 
+from viztracer import log_sparse
+
+try:
+    @profile
+    def f():
+        return
+except NameError:
+    def profile(f):
+        return f
+
 # from skimage.color import rgba2rgb
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
-from torch.profiler import profile, record_function, ProfilerActivity
+#from torch.profiler import profile, record_function, ProfilerActivity
 
 from cellvit.cell_segmentation.datasets.cell_graph_datamodel import CellGraphDataWSI
 from cellvit.cell_segmentation.utils.template_geojson import (
@@ -71,7 +88,7 @@ from cellvit.utils.logger import Logger
 from cellvit.utils.tools import unflatten_dict
 
 warnings.filterwarnings("ignore", category=ShapelyDeprecationWarning)
-pandarallel.initialize(progress_bar=False, nb_workers=12)
+#pandarallel.initialize(progress_bar=False, nb_workers=12)
 
 
 
@@ -92,11 +109,16 @@ TYPE_NUCLEI_DICT = {
     5: "Epithelial",
 }
 
-def load_wsi(wsi_path):
+# This file will be used to indicate that a image has been processed
+FLAG_FILE_NAME = ".cell_detection_done"
+
+def load_wsi(wsi_path, overwrite=False):
     try:
         wsi_name = wsi_path.stem
         patched_slide_path = Path(configuration["patch_dataset_path"]) / wsi_name
-        #cell_segmentation.logger.info(f"File {i+1}/{len(wsi_filelist)}: {wsi_name}")
+        flag_file_path = patched_slide_path / "cell_detection" / FLAG_FILE_NAME
+        if not overwrite and flag_file_path.exists():
+            return
         wsi_file = WSI(
             name=wsi_name,
             patient=wsi_name,
@@ -111,7 +133,7 @@ def load_wsi(wsi_path):
             
 
 class InferenceWSIDataset(Dataset):
-    def __init__(self, wsi_filelist, transform: Callable = None):
+    def __init__(self, wsi_filelist, n_workers: int = 0, overwrite=False, transform: Callable = None):
         self.wsi_files = []
 
         # This index will contain a repeat of all the wsi objects the number of
@@ -123,16 +145,37 @@ class InferenceWSIDataset(Dataset):
         self.transform = transform
 
         pb = tqdm.trange(len(wsi_filelist), desc='Loading WSI file list')
-        with multiprocessing.Pool() as pool:
-            for wsi_file in pool.imap(load_wsi, wsi_filelist):
+        already_processed_files = []
+        if n_workers > 0:
+            #Since this is mostly and IO-bound task, we use a thread pool
+            #with multiprocessing.Pool(n_workers) as pool:
+            with ThreadPool(n_workers) as pool:
+                load_wsi_partial = partial(load_wsi, overwrite=overwrite)
+                for wsi_file in pool.imap(load_wsi_partial, wsi_filelist):
+                    if isinstance(wsi_file, BaseException):
+                        logging.warn(f"Could not load file {wsi_file.wsi_file}, caught exception {str(wsi_file)}")
+                    elif wsi_file is None:
+                        already_processed_files.append(wsi_file)
+                    else:                    
+                        self.wsi_files.append(wsi_file)
+                        n_patches = wsi_file.get_number_patches()
+                        indexing_info = [(wsi_file, i) for i in range(n_patches)]
+                        self.wsi_index.extend(indexing_info)
+                    pb.update()
+        else:
+            for wsi_file_path in wsi_filelist:
+                wsi_file = load_wsi(wsi_file_path, overwrite)
                 if isinstance(wsi_file, BaseException):
                     logging.warn(f"Could not load file {wsi_file.wsi_file}, caught exception {str(wsi_file)}")
+                elif wsi_file is None:
+                    already_processed_files.append(wsi_file)
                 else:                    
                     self.wsi_files.append(wsi_file)
                     n_patches = wsi_file.get_number_patches()
                     indexing_info = [(wsi_file, i) for i in range(n_patches)]
                     self.wsi_index.extend(indexing_info)
                 pb.update()
+        
 
     def __len__(self):
         return len(self.wsi_index)
@@ -142,15 +185,116 @@ class InferenceWSIDataset(Dataset):
         patch, metadata = wsi_file.get_patch(local_idx, self.transform)
         return patch, local_idx, wsi_file, metadata
 
+    def get_n_files(self):
+        return len(self.wsi_files)
+
 
 def wsi_patch_collator(batch):
     patches, local_idx, wsi_file, metadata = zip(*batch) # Transpose the batch
     patches = torch.stack(patches)
     return patches, local_idx, wsi_file, metadata
-            
 
 
-def postprocess_predictions(predicted_batches, num_nuclei_classes, wsi, logger, dataset_config, overlap, patch_size, geojson, outdir):
+def f_post_process_manager(predictions_queue, progress_queue, postprocess_queue, quit_flag, finished_flag, postprocess_arguments, wait_time=2, n_workers=1):
+    #logger = logging.getLogger()
+    logger = postprocess_arguments.logger
+
+    wsi_work_map = {}
+
+    processes = [PostProcessWorker(postprocess_queue, progress_queue, postprocess_arguments, multiprocessing.Event(), wait_time) for i in range(n_workers)] 
+    for p in processes:
+        p.start()
+
+    while not quit_flag.is_set():
+        try:
+            predicted_batch = predictions_queue.get(True, wait_time)
+            predictions, local_idxs, wsi_files, metadatas = predicted_batch
+            for i, wsi_file in enumerate(wsi_files):
+                wsi_name = wsi_file.name
+                if wsi_name not in wsi_work_map:
+                    wsi_work_map[wsi_name] = []
+                wsi_work_list = wsi_work_map[wsi_name]
+                work_package = (local_idxs[i], predictions[i], metadatas[i])
+                wsi_work_list.append(work_package)
+                if len((wsi_work_list)) == wsi_file.get_number_patches():
+                    postprocess_work = (wsi_file, wsi_work_list)
+                    postprocess_queue.put(postprocess_work) 
+                    del wsi_work_map[wsi_name]
+        except queue.Empty:
+            pass
+
+    for p in processes:
+        p.quit_flag.set()
+
+    logger.info("Post process manager waiting for workers to exit")
+    for p in processes:
+        p.join()
+
+    finished_flag.set()
+
+
+class PostProcessWorker(multiprocessing.Process):
+    def __init__(self, postprocess_queue, progress_queue, postprocess_arguments, quit_flag, timeout_seconds=2):
+        super().__init__()
+        self.postprocess_queue = postprocess_queue
+        self.progress_queue = progress_queue
+        self.postprocess_arguments = postprocess_arguments
+        self.quit_flag = quit_flag
+        self.timeout_seconds = timeout_seconds
+
+    def run(self):
+        while not self.quit_flag.is_set():
+            try:
+                postprocess_work = self.postprocess_queue.get(True, self.timeout_seconds)
+                (wsi_file, wsi_work_list) = postprocess_work
+                f_post_processing_worker(wsi_file, wsi_work_list, self.postprocess_arguments, self.progress_queue)
+            except queue.Empty:
+                pass
+
+#@profile
+@log_sparse(stack_depth=6)
+def f_post_processing_worker(wsi_file, wsi_work_list, postprocess_arguments):
+    local_idxs, predictions_records, metadata = zip(*wsi_work_list)
+    # Merge the prediction records into a single dictionary again.
+    predictions = defaultdict(list)
+    for record in predictions_records:
+        for k,v in record.items():
+            predictions[k].append(v)
+    predictions_stacked = {k: torch.stack(v).to(torch.float32) for k,v in predictions.items()}
+    postprocess_predictions(predictions_stacked, metadata, wsi_file, postprocess_arguments)
+
+
+@dataclass
+class PostprocessArguments:
+    n_images: int
+    num_nuclei_classes: int
+    dataset_config: Dict
+    overlap: int 
+    patch_size: int
+    geojson: bool
+    subdir_name: str
+    logger: Logger
+    n_workers: int = 0
+    wait_time: float = 2.
+
+
+@profile
+def postprocess_predictions(predictions, metadata, wsi, postprocessing_args: PostprocessArguments):
+    # logger = postprocessing_args.logger
+    logger = logging.getLogger()
+    num_nuclei_classes = postprocessing_args.num_nuclei_classes
+    dataset_config = postprocessing_args.dataset_config
+    overlap = postprocessing_args.overlap
+    patch_size = postprocessing_args.patch_size
+    geojson = postprocessing_args.geojson
+    subdir_name = postprocessing_args.subdir_name
+
+    if subdir_name is not None:
+        outdir = Path(wsi.patched_slide_path) / "cell_detection" / subdir_name
+    else:
+        outdir = Path(wsi.patched_slide_path) / "cell_detection"
+    outdir.mkdir(exist_ok=True, parents=True)
+
     instance_types, tokens = get_cell_predictions_with_tokens(num_nuclei_classes,
         predictions, magnification=wsi.metadata["magnification"]
     )
@@ -316,6 +460,9 @@ def postprocess_predictions(predicted_batches, num_nuclei_classes, wsi, logger, 
     )
     torch.save(graph, outdir / "cells.pt")
 
+    flag_file = outdir / FLAG_FILE_NAME
+    flag_file.touch()
+
     cell_stats_df = pd.DataFrame(cell_dict_wsi["cells"])
     cell_stats = dict(cell_stats_df.value_counts("type"))
     nuclei_types_inverse = {v: k for k, v in nuclei_types.items()}
@@ -324,6 +471,8 @@ def postprocess_predictions(predicted_batches, num_nuclei_classes, wsi, logger, 
     logger.info("Stats:")
     logger.info(f"{verbose_stats}")
 
+
+@profile
 def post_process_edge_cells(cell_list: List[dict], logger) -> List[int]:
     """Use the CellPostProcessor to remove multiple cells and merge due to overlap
 
@@ -342,9 +491,10 @@ def post_process_edge_cells(cell_list: List[dict], logger) -> List[int]:
         List[int]: List with integers of cells that should be kept
     """
     cell_processor = CellPostProcessor(cell_list, logger)
-    cleaned_cells = cell_processor.post_process_cells()
+    cleaned_cells_idx = cell_processor.post_process_cells()
 
-    return list(cleaned_cells.index.values)
+    return sorted(cell_record["index"] for cell_record in cleaned_cells_idx)
+
 
 def convert_geojson(cell_list: list[dict], polygons: bool = False) -> List[dict]:
     """Convert a list of cells to a geojson object
@@ -404,6 +554,7 @@ def convert_geojson(cell_list: list[dict], polygons: bool = False) -> List[dict]
             ] = COLOR_DICT[cell_type]
             geojson_placeholder.append(cell_geojson_object)
     return geojson_placeholder
+
 
 def calculate_instance_map(num_nuclei_classes: int, predictions: OrderedDict, magnification: Literal[20, 40] = 40
     ) -> Tuple[torch.Tensor, List[dict]]:
@@ -532,9 +683,7 @@ class CellSegmentationInference:
         
         self.model.eval()
         self.model.to(self.device)
-        #self.model = torch.compile(self.model)
-        # TODO: add torch.compile and perhaps quantization/pruning to the model loading
-        #self.model = torch.jit.optimize_for_inference(torch.jit.script(self.model))
+        
 
     def __get_model(
         self, model_type: str
@@ -683,16 +832,6 @@ class CellSegmentationInference:
             outdir = Path(wsi.patched_slide_path) / "cell_detection"
         outdir.mkdir(exist_ok=True, parents=True)
 
-        cell_dict_wsi = []  # for storing all cell information
-        cell_dict_detection = []  # for storing only the centroids
-
-        graph_data = {
-            "cell_tokens": [],
-            "positions": [],
-            "contours": [],
-            "metadata": {"wsi_metadata": wsi.metadata, "nuclei_types": nuclei_types},
-        }
-
         predicted_batches = []
         with torch.no_grad():
             for batch in tqdm.tqdm(
@@ -715,36 +854,240 @@ class CellSegmentationInference:
 
     def process_wsi_filelist(self, 
                              wsi_filelist,
-                             subdir_name,
-                            geojson,
-                            batch_size):
+                            subdir_name: str = None,
+                            patch_size: int = 1024,
+                            overlap: int = 64,
+                            batch_size: int = 8,
+                            torch_compile: bool = False,
+                            geojson: bool = False,
+                            n_postprocess_workers: int = 0,
+                            n_dataloader_workers: int = 4,
+                            overwrite: bool = False):
+        if torch_compile:
+                self.logger.info("Model will be compiled using torch.compile. First batch will take a lot more time to compute.")
+                self.model = torch.compile(self.model)
+
+        dataset = InferenceWSIDataset(wsi_filelist, transform=self.inference_transforms, overwrite=overwrite, n_workers=n_postprocess_workers)
+        self.logger.info(f"Loaded dataset with {dataset.get_n_files()} images")
+
+        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=wsi_patch_collator, num_workers=n_dataloader_workers)
+        #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        post_process_arguments = PostprocessArguments(n_images=dataset.get_n_files(),
+                                                     num_nuclei_classes=self.model.num_nuclei_classes, 
+                                                     dataset_config=self.run_conf['dataset_config'], 
+                                                     overlap=overlap, 
+                                                     patch_size=patch_size, 
+                                                     geojson=geojson, 
+                                                     subdir_name=subdir_name,
+                                                     n_workers=n_postprocess_workers,
+                                                     logger=self.logger)
+        if n_postprocess_workers > 0:
+            self._process_wsi_filelist_multiprocessing(dataloader, 
+                                                       post_process_arguments)
+        else:
+            self._process_wsi_filelist_singleprocessing(dataloader, 
+                                                       post_process_arguments)
+
+
+        #print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+    
+    def _process_wsi_filelist_singleprocessing(self,
+                                              dataloader,
+                                              post_process_arguments):
+        wsi_work_map = {}
         
-        dataset = InferenceWSIDataset(wsi_filelist, transform=self.inference_transforms)
-        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=wsi_patch_collator)
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-            with torch.no_grad():
+        with torch.no_grad():
+            try:
+                for batch in tqdm.tqdm(dataloader, desc="Processing patches"):
+                    patches, local_idxs, wsi_files, metadatas = batch
+                    patches = patches.to(self.device)
+
+                    if self.mixed_precision:
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            predictions_ = self.model(patches, retrieve_tokens=True)
+                    else:
+                        predictions_ = self.model(patches, retrieve_tokens=True)
+                    # reshape, apply softmax to segmentation maps
+                    #predictions = self.model.reshape_model_output(predictions_, self.device)
+                    predictions = self.model.reshape_model_output(predictions_, 'cpu')
+                    # We break out the predictions into records (one dict per patch instead of all patches in one dict)
+                    prediction_records = [{k: v[i] for k,v in predictions.items()} for i in range(len(local_idxs))]
+
+                    for i, wsi_file in enumerate(wsi_files):
+                        wsi_name = wsi_file.name
+                        if wsi_name not in wsi_work_map:
+                            wsi_work_map[wsi_name] = []
+                        (wsi_work_list) = wsi_work_map[wsi_name]
+                        work_package = (local_idxs[i], prediction_records[i], metadatas[i])
+                        (wsi_work_list).append(work_package)
+                        if len((wsi_work_list)) == wsi_file.get_number_patches():
+                            local_idxs, predictions_records, metadata = zip(*wsi_work_list)
+                            # Merge the prediction records into a single dictionary again.
+                            predictions = defaultdict(list)
+                            for record in predictions_records:
+                                for k,v in record.items():
+                                    predictions[k].append(v)
+                            predictions_stacked = {k: torch.stack(v).to(torch.float32) for k,v in predictions.items()}
+                            postprocess_predictions(predictions_stacked, metadata, wsi_file, post_process_arguments)
+                            del wsi_work_map[wsi_name]
+                                        
+            except KeyboardInterrupt:
+                pass
+
+    def _process_wsi_filelist_multiprocessing(self,
+                                              dataloader,
+                                              post_process_arguments: PostprocessArguments):
+        
+        pbar_batches = tqdm.trange(len(dataloader), desc="Processing patch-batches")
+        pbar_postprocessing = tqdm.trange(post_process_arguments.n_images, desc="Postprocessed images")
+
+        wsi_work_map = {}
+
+        with torch.no_grad():
+            with multiprocessing.Pool(post_process_arguments.n_workers) as pool:
                 try:
-                    for i, batch in tqdm.tqdm(enumerate(dataloader), desc="Processing patches"):
+                    results = []
+                    
+                    for batch in dataloader:
                         patches, local_idxs, wsi_files, metadatas = batch
                         patches = patches.to(self.device)
-                        with record_function("model_inference"):
-                            if self.mixed_precision:
-                                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                                    predictions_ = self.model(patches, retrieve_tokens=True)
-                            else:
+                        
+                        if self.mixed_precision:
+                            with torch.autocast(device_type="cuda", dtype=torch.float16):
                                 predictions_ = self.model(patches, retrieve_tokens=True)
+                        else:
+                            predictions_ = self.model(patches, retrieve_tokens=True)
                         # reshape, apply softmax to segmentation maps
                         #predictions = self.model.reshape_model_output(predictions_, self.device)
                         predictions = self.model.reshape_model_output(predictions_, 'cpu')
-                        pass#print(predictions)
-                        if i > 10:
-                            break
+                        pbar_batches.update()
+                        
+                        # We break out the predictions into records (one dict per patch instead of all patches in one dict)
+                        prediction_records = [{k: v[i] for k,v in predictions.items()} for i in range(len(local_idxs))]
+                        
+                        for i, wsi_file in enumerate(wsi_files):
+                            wsi_name = wsi_file.name
+                            if wsi_name not in wsi_work_map:
+                                wsi_work_map[wsi_name] = []
+                            wsi_work_list = wsi_work_map[wsi_name]
+                            work_package = (local_idxs[i], prediction_records[i], metadatas[i])
+                            wsi_work_list.append(work_package)
+                            if len((wsi_work_list)) == wsi_file.get_number_patches():
+                                while len(results) >= post_process_arguments.n_workers:
+                                    n_working = len(results)
+                                    results = [result for result in results if not result.ready()]
+                                    n_done = n_working - len(results)
+                                    pbar_postprocessing.update(n_done)
+                                    pbar_batches.set_description(f"Processing patch-batches (waiting on postprocessing workers)")
+                                    sleep(post_process_arguments.wait_time)
+                                result = pool.apply_async(f_post_processing_worker, (wsi_file, wsi_work_list, post_process_arguments))
+                                pbar_batches.set_description(f"Processing patch-batches")
+                                results.append(result)
+                                del wsi_work_map[wsi_name]
+                    self.logger.info("Model predictions done, waiting for postprocessing to finish.")
+                    pool.close()
+                    pool.join()
                 except KeyboardInterrupt:
-                    pass
-            
-        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+                    pool.terminate()
+                    pool.join()
+        
+        
+        
+        
+    def _process_wsi_filelist_multiprocessing_old(self,
+                                              dataloader,
+                                              post_process_arguments: PostprocessArguments):
+        postprocess_batches_queue = multiprocessing.Queue(post_process_arguments.n_workers)
+        post_process_progress_queue = multiprocessing.Queue()
+        postprocess_images_queue = multiprocessing.Queue(post_process_arguments.n_workers)
+        post_process_quit_flag = multiprocessing.Event()
+        post_process_done_flag = multiprocessing.Event()
+        post_process_manager = multiprocessing.Process(target=f_post_process_manager, args=(postprocess_batches_queue, post_process_progress_queue, postprocess_images_queue, post_process_quit_flag, post_process_done_flag, post_process_arguments))
+        post_process_manager.start()
+        
+        pbar_batches = tqdm.trange(len(dataloader), desc="Processing patch-batches")
+        pbar_postprocessing = tqdm.trange(post_process_arguments.n_images, desc="Postprocessed images")
 
+        wsi_work_map = {}
 
+        processes = [PostProcessWorker(postprocess_queue, progress_queue, postprocess_arguments, multiprocessing.Event(), wait_time) for i in range(n_workers)] 
+        for p in processes:
+            p.start()
+
+        while not quit_flag.is_set():
+            try:
+                predicted_batch = predictions_queue.get(True, wait_time)
+                
+            except queue.Empty:
+                pass
+
+        for p in processes:
+            p.quit_flag.set()
+
+        logger.info("Post process manager waiting for workers to exit")
+        for p in processes:
+            p.join()
+
+        finished_flag.set()
+
+        with torch.no_grad():
+            try:
+                for batch in dataloader:
+                    patches, local_idxs, wsi_files, metadatas = batch
+                    patches = patches.to(self.device)
+                    
+                    if self.mixed_precision:
+                        with torch.autocast(device_type="cuda", dtype=torch.float16):
+                            predictions_ = self.model(patches, retrieve_tokens=True)
+                    else:
+                        predictions_ = self.model(patches, retrieve_tokens=True)
+                    # reshape, apply softmax to segmentation maps
+                    #predictions = self.model.reshape_model_output(predictions_, self.device)
+                    predictions = self.model.reshape_model_output(predictions_, 'cpu')
+                    # We break out the predictions into records (one dict per patch instead of all patches in one dict)
+                    prediction_records = [{k: v[i] for k,v in predictions.items()} for i in range(len(local_idxs))]
+                    #predicted_batch = (prediction_records, local_idxs, wsi_files, metadatas)
+                    #predictions, local_idxs, wsi_files, metadatas = predicted_batch
+                    for i, wsi_file in enumerate(wsi_files):
+                        wsi_name = wsi_file.name
+                        if wsi_name not in wsi_work_map:
+                            wsi_work_map[wsi_name] = []
+                        wsi_work_list = wsi_work_map[wsi_name]
+                        work_package = (local_idxs[i], predictions[i], metadatas[i])
+                        wsi_work_list.append(work_package)
+                        if len((wsi_work_list)) == wsi_file.get_number_patches():
+                            postprocess_work = (wsi_file, wsi_work_list)
+                            post_process_images_queue.put(postprocess_work) 
+                            del wsi_work_map[wsi_name]
+
+                    postprocess_batches_queue.put(predicted_batch)
+                    pbar_batches.update()
+                    
+                    pbar_batches.set_description(f"Processing patch-batches({postprocess_batches_queue.qsize()} on queue)")
+                    pbar_postprocessing.set_description(f"Processing images ({postprocess_images_queue.qsize()} on queue)")
+                    while True:
+                        try:
+                            progress_report = post_process_progress_queue.get(False)
+                            pbar_postprocessing.update()
+                        except queue.Empty:
+                            break
+
+            except KeyboardInterrupt:
+                # We still tell the process to quit in its own time
+                post_process_quit_flag.set()
+        
+        # Tell the 
+        post_process_done_flag.set() 
+        
+        while not post_process_done_flag.is_set():
+            try:
+                progress_report = post_process_progress_queue.get(True, 5)
+                pbar_postprocessing.update()
+            except queue.Empty:
+                continue
+
+        self.logger.info("Waiting for postprocessing to finish")
+        post_process_manager.join() 
 
     def get_cell_predictions_with_tokens(
         self, predictions: dict, magnification: int = 40
@@ -800,69 +1143,9 @@ class CellSegmentationInference:
 
         return list(cleaned_cells.index.values)
 
-    def convert_geojson(
-        self, cell_list: list[dict], polygons: bool = False
-    ) -> List[dict]:
-        """Convert a list of cells to a geojson object
-
-        Either a segmentation object (polygon) or detection points are converted
-
-        Args:
-            cell_list (list[dict]): Cell list with dict entry for each cell.
-                Required keys for detection:
-                    * type
-                    * centroid
-                Required keys for segmentation:
-                    * type
-                    * contour
-            polygons (bool, optional): If polygon segmentations (True) or detection points (False). Defaults to False.
-
-        Returns:
-            List[dict]: Geojson like list
-        """
-        if polygons:
-            cell_segmentation_df = pd.DataFrame(cell_list)
-            detected_types = sorted(cell_segmentation_df.type.unique())
-            geojson_placeholder = []
-            for cell_type in detected_types:
-                cells = cell_segmentation_df[cell_segmentation_df["type"] == cell_type]
-                contours = cells["contour"].to_list()
-                final_c = []
-                for c in contours:
-                    c.append(c[0])
-                    final_c.append([c])
-
-                cell_geojson_object = get_template_segmentation()
-                cell_geojson_object["id"] = str(uuid.uuid4())
-                cell_geojson_object["geometry"]["coordinates"] = final_c
-                cell_geojson_object["properties"]["classification"][
-                    "name"
-                ] = TYPE_NUCLEI_DICT[cell_type]
-                cell_geojson_object["properties"]["classification"][
-                    "color"
-                ] = COLOR_DICT[cell_type]
-                geojson_placeholder.append(cell_geojson_object)
-        else:
-            cell_detection_df = pd.DataFrame(cell_list)
-            detected_types = sorted(cell_detection_df.type.unique())
-            geojson_placeholder = []
-            for cell_type in detected_types:
-                cells = cell_detection_df[cell_detection_df["type"] == cell_type]
-                centroids = cells["centroid"].to_list()
-                cell_geojson_object = get_template_point()
-                cell_geojson_object["id"] = str(uuid.uuid4())
-                cell_geojson_object["geometry"]["coordinates"] = centroids
-                cell_geojson_object["properties"]["classification"][
-                    "name"
-                ] = TYPE_NUCLEI_DICT[cell_type]
-                cell_geojson_object["properties"]["classification"][
-                    "color"
-                ] = COLOR_DICT[cell_type]
-                geojson_placeholder.append(cell_geojson_object)
-        return geojson_placeholder
-
 
 class CellPostProcessor:
+    @profile
     def __init__(self, cell_list: List[dict], logger: logging.Logger) -> None:
         """POst-Processing a list of cells from one WSI
 
@@ -880,21 +1163,34 @@ class CellPostProcessor:
         """
         self.logger = logger
         self.logger.info("Initializing Cell-Postprocessor")
-        self.cell_df = pd.DataFrame(cell_list)
-        self.cell_df = self.cell_df.parallel_apply(convert_coordinates, axis=1)
 
-        self.mid_cells = self.cell_df[
-            self.cell_df["cell_status"] == 0
-        ]  # cells in the mid
-        self.cell_df_margin = self.cell_df[
-            self.cell_df["cell_status"] != 0
-        ]  # cells either torching the border or margin
+        for index, cell_dict in enumerate(cell_list):
+            # TODO: Shouldn't it be the other way around? Column = x, Row = Y
+            x,y = cell_dict["patch_coordinates"]
+            cell_dict["patch_row"] = x
+            cell_dict["patch_col"] = y
+            cell_dict["patch_coordinates"] = f"{x}_{y}"
+            cell_dict["index"] = index
 
-    def post_process_cells(self) -> pd.DataFrame:
+        #self.cell_df = pd.DataFrame(cell_list)
+        self.cell_records = cell_list
+
+        #xs, ys = zip(*self.cell_df["patch_coordinates"])
+        
+        #self.cell_df["patch_row"] = xs
+        #self.cell_df["patch_col"] = ys
+        #self.cell_df["patch_coordinates"] = [f"{x}_{y}" for x,y in zip(xs, ys)]
+        # The call to DataFrame.apply below was exceedingly slow, the list comprehension above is _much_ faster
+        #self.cell_df = self.cell_df.apply(convert_coordinates, axis=1)
+        self.mid_cells = [cell_record for cell_record in self.cell_records if cell_record["cell_status"] == 0]
+        self.margin_cells = [cell_record for cell_record in self.cell_records if cell_record["cell_status"] != 0]
+        
+    @profile
+    def post_process_cells(self) -> List[Dict]:
         """Main Post-Processing coordinator, entry point
 
         Returns:
-            pd.DataFrame: DataFrame with post-processed and cleaned cells
+            List[Dict]: List of records (dictionaries) with post-processed and cleaned cells
         """
         self.logger.info("Finding edge-cells for merging")
         cleaned_edge_cells = self._clean_edge_cells()
@@ -902,56 +1198,52 @@ class CellPostProcessor:
         cleaned_edge_cells = self._remove_overlap(cleaned_edge_cells)
 
         # merge with mid cells
-        postprocessed_cells = pd.concat(
-            [self.mid_cells, cleaned_edge_cells]
-        ).sort_index()
+        postprocessed_cells = self.mid_cells + cleaned_edge_cells
+
         return postprocessed_cells
 
-    def _clean_edge_cells(self) -> pd.DataFrame:
-        """Create a DataFrame that just contains all margin cells (cells inside the margin, not touching the border)
+    @profile
+    def _clean_edge_cells(self) -> List[Dict]:
+        """Create a record list that just contains all margin cells (cells inside the margin, not touching the border)
         and border/edge cells (touching border) with no overlapping equivalent (e.g, if patch has no neighbour)
 
         Returns:
-            pd.DataFrame: Cleaned DataFrame
+            List[Dict]: Cleaned record list
         """
 
-        margin_cells = self.cell_df_margin[
-            self.cell_df_margin["edge_position"] == 0
-        ]  # cells at the margin, but not touching the border
-        edge_cells = self.cell_df_margin[
-            self.cell_df_margin["edge_position"] == 1
-        ]  # cells touching the border
-        existing_patches = list(set(self.cell_df_margin["patch_coordinates"].to_list()))
+        margin_cells = [record for record in self.cell_records if record["edge_position"] == 0]
+        edge_cells = [record for record in self.cell_records if record["edge_position"] == 1]
+        
+        existing_patches = list(set(record["patch_coordinates"] for record in self.margin_cells))
 
-        edge_cells_unique = pd.DataFrame(
-            columns=self.cell_df_margin.columns
-        )  # cells torching the border without having an overlap from other patches
+        edge_cells_unique = []
 
-        for idx, cell_info in edge_cells.iterrows():
-            edge_information = dict(cell_info["edge_information"])
+        for record in edge_cells:
+            edge_information = record["edge_information"]
             edge_patch = edge_information["edge_patches"][0]
             edge_patch = f"{edge_patch[0]}_{edge_patch[1]}"
             if edge_patch not in existing_patches:
-                edge_cells_unique.loc[idx, :] = cell_info
+                edge_cells_unique.append(record)
 
-        cleaned_edge_cells = pd.concat([margin_cells, edge_cells_unique])
+        cleaned_edge_cells = margin_cells + edge_cells_unique
 
-        return cleaned_edge_cells.sort_index()
+        return cleaned_edge_cells
 
-    def _remove_overlap(self, cleaned_edge_cells: pd.DataFrame) -> pd.DataFrame:
-        """Remove overlapping cells from provided DataFrame
+    @profile
+    def _remove_overlap(self, cleaned_edge_cells: List[Dict]) -> List[Dict]:
+        """Remove overlapping cells from provided cell record list
 
         Args:
-            cleaned_edge_cells (pd.DataFrame): DataFrame that should be cleaned
+            cleaned_edge_cells (List[Dict]): List[Dict] that should be cleaned
 
         Returns:
-            pd.DataFrame: Cleaned DataFrame
+            List[Dict]: Cleaned cell records
         """
         merged_cells = cleaned_edge_cells
 
         for iteration in range(20):
             poly_list = []
-            for idx, cell_info in merged_cells.iterrows():
+            for i, cell_info in enumerate(merged_cells):
                 poly = Polygon(cell_info["contour"])
                 if not poly.is_valid:
                     self.logger.debug("Found invalid polygon - Fixing with buffer 0")
@@ -966,7 +1258,7 @@ class CellPostProcessor:
                             poly = Polygon(poly)
                     else:
                         poly = Polygon(multi)
-                poly.uid = idx
+                poly.uid = i
                 poly_list.append(poly)
 
             # use an strtree for fast querying
@@ -1025,11 +1317,9 @@ class CellPostProcessor:
                 self.logger.info(
                     f"Not all doubled cells removed, still {overlaps} to remove. For perfomance issues, we stop iterations now. Please raise an issue in git or increase number of iterations."
                 )
-            merged_cells = cleaned_edge_cells.loc[
-                cleaned_edge_cells.index.isin(merged_idx)
-            ].sort_index()
-
-        return merged_cells.sort_index()
+            
+            merged_cells = [cleaned_edge_cells[i] for i in merged_idx]
+        return merged_cells
 
 
 def convert_coordinates(row: pd.Series) -> pd.Series:
@@ -1199,11 +1489,33 @@ class InferenceWSIParser:
             " Default: False",
         )
         parser.add_argument(
+            "--torch_compile",
+            action="store_true",
+            help="Whether to use torch.compile to compile the model before inference. Has an large overhead for single predictions but leads to a significant speedup when predicting on multiple images."
+            " Default: False",
+        )
+
+        parser.add_argument(
             "--batch_size",
             type=int,
             help="Inference batch-size. Default: 8",
             default=8,
         )
+
+        parser.add_argument(
+            "--n_postprocess_workers",
+            type=int,
+            help="Number of processes to dedicate to post processing. Set to 0 to disable multiprocessing for post processing.  Default: 8",
+            default=8,
+        )
+
+        parser.add_argument(
+            "--n_dataloader_workers",
+            type=int,
+            help="Number of workers to use for the pytorch patch dataloader. Default: 4",
+            default=4,
+        )
+
         parser.add_argument(
             "--outdir_subdir",
             type=str,
@@ -1214,6 +1526,12 @@ class InferenceWSIParser:
             "--geojson",
             action="store_true",
             help="Set this flag to export results as additional geojson files for loading them into Software like QuPath.",
+        )
+
+        parser.add_argument(
+            "--overwrite",
+            action="store_true",
+            help=f"If set, include all found pre-processed files even if they include a \"{FLAG_FILE_NAME}\" file.",
         )
 
         # subparsers for either loading a WSI or a WSI folder
@@ -1357,10 +1675,16 @@ if __name__ == "__main__":
                     )
                 )
             ]
+            #if not configuration["overwrite"]:
+            #    wsi_filelist = filter_processed_file(wsi_filelist)
 
         cell_segmentation.process_wsi_filelist(
             wsi_filelist,
             subdir_name=configuration["outdir_subdir"],
             geojson=configuration["geojson"],
             batch_size=configuration["batch_size"],
+            torch_compile=configuration["torch_compile"],
+            n_postprocess_workers=configuration["n_postprocess_workers"],
+            n_dataloader_workers=configuration["n_dataloader_workers"],
+            overwrite=configuration["overwrite"]
         )
