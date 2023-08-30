@@ -14,12 +14,14 @@
 from dataclasses import dataclass
 from functools import partial
 import inspect
+from io import BytesIO
 import os
 import queue
 import sys
 #import multiprocessing.dummy as multiprocessing
 import multiprocessing
 from multiprocessing.pool import ThreadPool
+import zipfile
 
 from time import sleep
 
@@ -226,6 +228,8 @@ def postprocess_predictions(predictions, metadata, wsi, postprocessing_args: Pos
         outdir = Path(wsi.patched_slide_path) / "cell_detection"
     outdir.mkdir(exist_ok=True, parents=True)
 
+    outfile = outdir / "cell_detection.zip"
+
     instance_types, tokens = get_cell_predictions_with_tokens(num_nuclei_classes,
         predictions, magnification=wsi.metadata["magnification"]
     )
@@ -357,39 +361,41 @@ def postprocess_predictions(predictions, metadata, wsi, postprocessing_args: Pos
     "type_map": dataset_config["nuclei_types"],
     "cells": cell_dict_wsi,
     }
-    with open(str(outdir / "cells.json"), "w") as outfile:
-        ujson.dump(cell_dict_wsi, outfile, indent=2)
-    if geojson:
-        logger.info("Converting segmentation to geojson")
     
-    geojson_list = convert_geojson(cell_dict_wsi["cells"], True)
-    with open(str(str(outdir / "cells.geojson")), "w") as outfile:
-        ujson.dump(geojson_list, outfile, indent=2)
+    with zipfile.ZipFile(outfile, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        zf.writestr("cells.json", ujson.dumps(cell_dict_wsi, outfile, indent=2))
+        
+        if geojson:
+            logger.info("Converting segmentation to geojson")
+        
+        geojson_list = convert_geojson(cell_dict_wsi["cells"], True)
+        zf.writestr("cells.geojson", ujson.dumps(geojson_list, outfile, indent=2))
 
-    cell_dict_detection = {
-    "wsi_metadata": wsi.metadata,
-    "processed_patches": processed_patches,
-    "type_map": dataset_config["nuclei_types"],
-    "cells": cell_dict_detection,
-    }
-    with open(str(outdir / "cell_detection.json"), "w") as outfile:
-        ujson.dump(cell_dict_detection, outfile, indent=2)
-    if geojson:
-        logger.info("Converting detection to geojson")
-    geojson_list = convert_geojson(cell_dict_wsi["cells"], False)
-    with open(str(str(outdir / "cell_detection.geojson")), "w") as outfile:
-        ujson.dump(geojson_list, outfile, indent=2)
+        cell_dict_detection = {
+        "wsi_metadata": wsi.metadata,
+        "processed_patches": processed_patches,
+        "type_map": dataset_config["nuclei_types"],
+        "cells": cell_dict_detection,
+        }
+        zf.writestr("cell_detection.json", ujson.dumps(cell_dict_detection, outfile, indent=2))
+        if geojson:
+            logger.info("Converting detection to geojson")
+        geojson_list = convert_geojson(cell_dict_wsi["cells"], False)
+        zf.writestr("cell_detection.geojson", ujson.dumps(geojson_list, outfile, indent=2))
 
-    logger.info(
-    f"Create cell graph with embeddings and save it under: {str(outdir / 'cells.pt')}"
-    )
-    graph = CellGraphDataWSI(
-    x=torch.stack(graph_data["cell_tokens"]),
-    positions=torch.stack(graph_data["positions"]),
-    contours=graph_data["contours"],
-    metadata=graph_data["metadata"],
-    )
-    torch.save(graph, outdir / "cells.pt")
+        logger.info(
+        f"Create cell graph with embeddings and save it under: {str(outdir / 'cells.pt')}"
+        )
+        graph = CellGraphDataWSI(
+        x=torch.stack(graph_data["cell_tokens"]),
+        positions=torch.stack(graph_data["positions"]),
+        contours=graph_data["contours"],
+        metadata=graph_data["metadata"],
+        )
+        torch_bytes_io = BytesIO()
+        #torch.save(graph, outdir / "cells.pt")
+        torch.save(graph, torch_bytes_io)
+        zf.writestr("cells.pt", torch_bytes_io.getvalue())
 
     flag_file = outdir / FLAG_FILE_NAME
     flag_file.touch()
