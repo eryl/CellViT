@@ -1,0 +1,17 @@
+# dataset paths
+output_path: ./PANDa/output/preprocessing
+
+# basic setups
+patch_size: 1024
+patch_overlap: 6.25
+target_mag: 40
+processes: 14
+overwrite: False
+slide_mpp: 0.48
+wsi_extension: tiff
+
+# macenko stain normalization
+normalize_stains: True
+
+# finding patches
+min_intersection_ratio: 0.05
