@@ -16,6 +16,6 @@ def load_wsi_files_from_csv(csv_path: Union[Path, str], wsi_extension: str) -> L
     """
     wsi_filelist = pd.read_csv(csv_path)
     wsi_filelist = wsi_filelist["Filename"].to_list()
-    wsi_filelist = [f for f in wsi_filelist if Path(f).suffix == f".{wsi_extension}"]
+    wsi_filelist = [Path(f) for f in wsi_filelist if Path(f).suffix == f".{wsi_extension}"]
 
     return wsi_filelist

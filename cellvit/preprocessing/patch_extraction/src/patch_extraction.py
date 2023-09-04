@@ -148,7 +148,8 @@ class PreProcessor(object):
         with open(wsi_filelist, "r") as csv_file:
             csv_reader = csv.reader(csv_file)
             for row in csv_reader:
-                self.files.append(Path(row[0]))
+                if row:
+                    self.files.append(Path(row[0]))
         self.files = sorted(self.files, key=lambda x: x.name)
         self.num_files = len(self.files)
 
@@ -202,7 +203,7 @@ class PreProcessor(object):
             and hardware_selection.lower() == "cucim"
         ):
             logger.info("Using CuCIM")
-            from cucim import CuImage
+            from cucim.clara import CuImage
 
             from preprocessing.patch_extraction.src.cucim_deepzoom import (
                 DeepZoomGeneratorCucim,
